@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs, strip_basedirs_from_arg,
+    hash_all, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -45,7 +45,8 @@ use std::sync::{Arc, LazyLock};
 use crate::errors::*;
 
 use super::CacheControl;
-use super::preprocessor_cache::PreprocessorCacheEntry;
+use super::line_markers::normalize_line_marker_paths;
+use super::preprocessor_cache::{PreprocessorCacheEntry, PreprocessorMetadata};
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -158,6 +159,7 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
+    metadata_from_manifest: bool,
     preprocessor_stderr: Vec<u8>,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
@@ -415,8 +417,9 @@ where
         cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
+        let basedirs = crate::config::compile_basedirs(storage.basedirs(), &env_vars);
 
-        let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
+        let mut extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
         let assembler_digest = if self.parsed_args.uses_external_assembler {
@@ -436,6 +439,37 @@ where
         } else {
             Cow::Owned(cwd.join(&self.parsed_args.input))
         };
+
+        let mut output_context = Digest::new();
+        let mut outputs = self.parsed_args.outputs.iter().collect::<Vec<_>>();
+        outputs.sort_unstable_by_key(|(name, _)| *name);
+        for (name, output) in outputs {
+            name.hash(&mut HashToDigest {
+                digest: &mut output_context,
+            });
+            output.path.hash(&mut HashToDigest {
+                digest: &mut output_context,
+            });
+        }
+        self.parsed_args.dependency_args.hash(&mut HashToDigest {
+            digest: &mut output_context,
+        });
+        let output_context = output_context.finish();
+        if self.parsed_args.language.is_c_like_header() {
+            // Binary PCHs retain input paths that the compiler's prefix maps
+            // do not relocate. Keep their cache entries local to this build.
+            let mut pch_context = Digest::new();
+            absolute_input_path.hash(&mut HashToDigest {
+                digest: &mut pch_context,
+            });
+            cwd.hash(&mut HashToDigest {
+                digest: &mut pch_context,
+            });
+            pch_context.update(output_context.as_bytes());
+            extra_hashes.push(pch_context.finish());
+        }
+        let mut preprocessor_extra_hashes = extra_hashes.clone();
+        preprocessor_extra_hashes.push(output_context);
 
         // Try to look for a cached preprocessing step for this compilation
         // request.
@@ -493,14 +527,14 @@ where
                 &self.executable_digest,
                 self.parsed_args.language,
                 &preprocessor_and_arch_args,
-                &extra_hashes,
+                &preprocessor_extra_hashes,
                 assembler_digest.as_deref(),
                 &env_vars,
                 &absolute_input_path,
                 self.compiler.plusplus(),
                 self.parsed_args.is_multiarch(),
                 preprocessor_cache_mode_config,
-                storage.basedirs(),
+                &cwd,
             )?
         } else {
             None
@@ -518,7 +552,7 @@ where
                 let mut preprocessor_cache_entry = PreprocessorCacheEntry::read(&buf)?;
                 let mut updated = false;
                 let hit = preprocessor_cache_entry
-                    .lookup_result_digest(preprocessor_cache_mode_config, &mut updated);
+                    .lookup_result(preprocessor_cache_mode_config, &mut updated);
 
                 let mut update_failed = false;
                 if updated {
@@ -536,33 +570,45 @@ where
                 }
 
                 if !update_failed {
-                    if let Some(key) = hit {
-                        debug!("Preprocessor cache hit: {preprocessor_key}");
-                        // A compiler binary may be a symlink to another and
-                        // so has the same digest, but that means
-                        // the toolchain will not contain the correct path
-                        // to invoke the compiler! Add the compiler
-                        // executable path to try and prevent this
-                        let weak_toolchain_key = format!(
-                            "{}-{}",
-                            self.executable.to_string_lossy(),
-                            self.executable_digest
-                        );
-                        return Ok(HashResult {
-                            key,
-                            compilation: Box::new(CCompilation {
-                                parsed_args: self.parsed_args.clone(),
-                                is_locally_preprocessed: false,
-                                preprocessor_stderr: Vec::new(),
-                                #[cfg(feature = "dist-client")]
-                                preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
-                                executable: self.executable.clone(),
-                                compiler: self.compiler.to_owned(),
-                                cwd: cwd.clone(),
-                                env_vars: env_vars.clone(),
-                            }),
-                            weak_toolchain_key,
-                        });
+                    if let Some((key, metadata)) = hit {
+                        let dependency_ready =
+                            match (self.parsed_args.outputs.get("d"), &metadata.dependency_file) {
+                                (None, _) => true,
+                                (Some(output), Some(bytes)) => {
+                                    fs::write(cwd.join(&output.path), bytes).is_ok()
+                                }
+                                _ => false,
+                            };
+                        if dependency_ready {
+                            debug!("Preprocessor cache hit: {preprocessor_key}");
+                            // A compiler binary may be a symlink to another and
+                            // so has the same digest, but that means
+                            // the toolchain will not contain the correct path
+                            // to invoke the compiler! Add the compiler
+                            // executable path to try and prevent this
+                            let weak_toolchain_key = format!(
+                                "{}-{}",
+                                self.executable.to_string_lossy(),
+                                self.executable_digest
+                            );
+                            return Ok(HashResult {
+                                key,
+                                compilation: Box::new(CCompilation {
+                                    parsed_args: self.parsed_args.clone(),
+                                    is_locally_preprocessed: false,
+                                    metadata_from_manifest: true,
+                                    preprocessor_stderr: metadata.stderr,
+                                    #[cfg(feature = "dist-client")]
+                                    preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON
+                                        .to_vec(),
+                                    executable: self.executable.clone(),
+                                    compiler: self.compiler.to_owned(),
+                                    cwd: cwd.clone(),
+                                    env_vars: env_vars.clone(),
+                                }),
+                                weak_toolchain_key,
+                            });
+                        }
                     } else {
                         debug!("Preprocessor cache miss: {preprocessor_key}");
                     }
@@ -679,7 +725,7 @@ where
         .with_extra_hashes(&extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
-        .with_basedirs(storage.basedirs())
+        .with_basedirs(&basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
         .with_input_file_name(hashed_input_file_name(
             self.parsed_args.language,
@@ -687,9 +733,17 @@ where
         ))
         .compute();
 
+        // The shared object entry may contain another checkout's depfile. Keep
+        // the current depfile with the local manifest for subsequent direct hits.
+        let dependency_file = self
+            .parsed_args
+            .outputs
+            .get("d")
+            .and_then(|output| fs::read(cwd.join(&output.path)).ok());
         // Cache the preprocessing step
         if let Some(preprocessor_key) = preprocessor_key
             && !include_files.is_empty()
+            && (!self.parsed_args.outputs.contains_key("d") || dependency_file.is_some())
         {
             let mut preprocessor_cache_entry = PreprocessorCacheEntry::new();
             let mut files: Vec<_> = include_files
@@ -697,7 +751,15 @@ where
                 .map(|(path, digest)| (digest, path))
                 .collect();
             files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-            preprocessor_cache_entry.add_result(start_of_compilation, &key, files);
+            preprocessor_cache_entry.add_result_with_metadata(
+                start_of_compilation,
+                &key,
+                files,
+                PreprocessorMetadata {
+                    dependency_file,
+                    stderr: preprocessor_stderr.clone(),
+                },
+            );
 
             if let Err(e) = storage
                 .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
@@ -720,6 +782,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
+                metadata_from_manifest: false,
                 preprocessor_stderr,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
@@ -1298,8 +1361,12 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self.is_locally_preprocessed
     }
 
+    fn has_current_dependency_file(&self) -> bool {
+        self.is_locally_preprocessed || self.metadata_from_manifest
+    }
+
     fn cached_stdout(&self, stdout: Vec<u8>) -> Vec<u8> {
-        if !self.is_locally_preprocessed {
+        if !self.is_locally_preprocessed && !self.metadata_from_manifest {
             return stdout;
         }
         self.compiler
@@ -1526,10 +1593,10 @@ fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"14";
+pub const CACHE_VERSION: &[u8] = b"15";
 
 /// Environment variables that are factored into the cache key.
-static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
+pub(super) static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     [
         // SCCACHE_C_CUSTOM_CACHE_BUSTER has no particular meaning behind it,
         // serving as a way for the user to factor custom data into the hash.
@@ -1700,8 +1767,8 @@ impl<'a> HashKeyParams<'a> {
             }
         }
 
-        // Strip basedirs from preprocessor output if configured
-        let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
+        let preprocessor_output_to_hash =
+            normalize_line_marker_paths(self.preprocessor_output, self.basedirs);
 
         m.update(&preprocessor_output_to_hash);
         m.finish()
@@ -1934,7 +2001,7 @@ mod test {
             .compute();
         assert_eq!(h_cpp1, h_cpp2);
 
-        // Test 5: Doesn't work with trailing slash in basedir, they must be normalized in config
+        // Roots passed directly to this helper must be normalized by Config.
         let basedir_slash = b"/home/user1/project/".to_vec();
         let h_slash = hash_with_basedirs(preprocessed1, std::slice::from_ref(&basedir_slash));
         assert_neq!(h1, h_slash);

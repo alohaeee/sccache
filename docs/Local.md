@@ -41,6 +41,17 @@ On Linux and macOS, the server remembers the digest of each file it hashes for t
 mtime, ctime, device and inode are unchanged, so a cache hit does not re-read unchanged headers. Files changed less than two
 seconds before being hashed are not remembered, as their timestamps may not tell a quick rewrite apart.
 
+Direct manifests are keyed by the actual input path, working directory,
+preprocessor/dependency arguments and output paths. They are not shared across
+checkouts through `basedirs`, because their header paths and dependency files
+belong to a specific compilation context. Cross-checkout object hits still work:
+local preprocessing checks the current headers and produces the current depfile
+before looking up the shared object. Local repeated compiles retain direct-mode
+hits. Each local manifest also stores its own depfile and preprocessor diagnostic
+metadata: a local direct hit must not replay the producer's depfile from the
+shared object entry. Old manifest and C-family object-cache namespaces are
+invalidated by this change.
+
 Configuration options and their default values:
 
 - `use_preprocessor_cache_mode`: `true`. Whether to use preprocessor cache mode. This can be overridden for an sccache invocation by setting the environment variable `SCCACHE_DIRECT` to `true`/`on`/`1` or `false`/`off`/`0`.

@@ -17,6 +17,7 @@ mod args;
 mod c;
 mod cicc;
 mod clang;
+mod line_markers;
 #[macro_use]
 #[allow(clippy::module_inception)]
 mod compiler;

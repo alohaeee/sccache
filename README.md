@@ -355,11 +355,28 @@ export SCCACHE_BASEDIRS="/home/user/project:/home/user/workspace"
 
 Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems.
 
-Base directories are stripped from the preprocessed source and from the compiler arguments alike. The arguments matter because a flag can name the tree it is building: `-ffile-prefix-map=/home/user/project=.` makes the object file independent of where the tree is checked out, but the flag itself is not, and it is hashed verbatim.
+For C/C++, base directories are stripped from preprocessor line-marker filenames and pathname compiler arguments. Program string literals, including raw strings, are preserved. The arguments matter because a flag can name the tree it is building: `-ffile-prefix-map=/home/user/project=.` makes the object file independent of where the tree is checked out, but the flag itself is not, and it is hashed verbatim.
 
 In an argument only the places that are expected to spell a pathname are considered: the whole argument, the value of an option written with an `=` (either half of a prefix map), and the value glued to a short option such as `-I`. A base directory appearing anywhere else is left alone, so a definition the compiler bakes into the output verbatim, `-DROOT="/home/user/project"`, still counts. A match also has to end where a path component ends, so a sibling `/home/user/project-docs` is not one.
 
 For Rust, base directories are also stripped from the working directory, from the `CARGO_*` environment variables such as `CARGO_MANIFEST_DIR`, and from the variables a crate reads with `env!` or `option_env!`, such as a build script's `OUT_DIR`. A hit then returns a crate compiled in another directory: its debug info and panic messages name that directory unless `--remap-path-prefix` maps it away, and so does any `env!("CARGO_MANIFEST_DIR")` the crate keeps.
+
+C-family compilations read `SCCACHE_BASEDIRS` from each compile request. An absent
+value uses the server's configured roots; an empty value disables normalization
+for that request. A running server therefore needs no restart for a new checkout.
+Rust's existing server-configured basedir behavior is unchanged.
+
+Direct-mode manifests remain local to the actual source path, working directory,
+dependency arguments and outputs. The first compile in another checkout runs its
+own preprocessor and can reuse the shared object, retaining its own dependency
+file. Subsequent local compiles can use direct mode. Binary PCH outputs are local
+to their input/build paths; their consumers can still share object files.
+
+Basedirs do not rewrite compiler output. Use matching compiler prefix maps and a
+stable debug compilation directory when sharing debug builds. Runtime path
+literals intentionally distinguish objects between checkouts; generating relative
+metadata can improve hits. Unity files must contain equivalent inputs: basedirs
+cannot make different source groupings interchangeable.
 
 This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 * Building the same project from different directories

@@ -670,14 +670,9 @@ where
                     stderr: entry.get_stderr(),
                 };
 
-                let filtered_outputs = if compilation.is_locally_preprocessed() {
-                    // In this mode, cache entries are exclusively distinguished by their preprocessed
-                    // source contents. But two files may differ in their names and / or the names of
-                    // included files while still producing the same preprocessed output, so they get the
-                    // same cache entry. That entry will have wrong (file names) dependency informaton in
-                    // the dependency file except for the compilation unit that originally produced it.
-                    // Since we did local preprocessing, that should already have produced the dependency
-                    // file - just leave that one alone and don't overwrite it from the cache.
+                let filtered_outputs = if compilation.has_current_dependency_file() {
+                    // Shared objects may carry another build's dependency paths.
+                    // Keep the depfile produced locally or restored from its manifest.
                     outputs
                         .iter()
                         .filter(|fobj_source| fobj_source.key != "d") // key "d" means dependency file
@@ -1164,6 +1159,10 @@ where
 
     fn is_locally_preprocessed(&self) -> bool {
         true
+    }
+
+    fn has_current_dependency_file(&self) -> bool {
+        self.is_locally_preprocessed()
     }
 
     /// Adjust the stdout replayed from a cache hit for this compilation.

@@ -1312,6 +1312,71 @@ fn config_file(env_var: &str, leaf: &str) -> PathBuf {
     dirs.config_dir().join(leaf)
 }
 
+fn normalized_basedirs(directories: Vec<String>) -> Result<Vec<Vec<u8>>> {
+    let mut basedirs = Vec::with_capacity(directories.len());
+    for d in directories {
+        let p = Utf8TypedPathBuf::from(d);
+        if !p.is_absolute() {
+            bail!("Basedir path must be absolute: {:?}", p);
+        }
+        // Normalize basedir:
+        // remove double separators, cur_dirs, parent_dirs, trailing slashes
+        let p_norm = p.normalize();
+        let mut bytes = p_norm.to_string().into_bytes();
+
+        // Always add a trailing `/` to basedirs to ensure we only match complete path
+        // components
+        bytes.push(b'/');
+
+        // normalize windows paths: use slashes and lowercase
+        let normalized = {
+            #[cfg(target_os = "windows")]
+            {
+                normalize_win_path(&bytes)
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                bytes
+            }
+        };
+        // push only if not already present
+        if !basedirs.contains(&normalized) {
+            basedirs.push(normalized);
+        }
+    }
+    Ok(basedirs)
+}
+
+pub(crate) fn compile_basedirs<'a>(
+    configured: &'a [Vec<u8>],
+    env_vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> std::borrow::Cow<'a, [Vec<u8>]> {
+    let Some((_, value)) = env_vars
+        .iter()
+        .find(|(key, _)| crate::util::env_var_name_matches(key, "SCCACHE_BASEDIRS"))
+    else {
+        return std::borrow::Cow::Borrowed(configured);
+    };
+    let Some(value) = value.to_str() else {
+        warn!("Ignoring invalid non-UTF-8 request basedirs; path normalization disabled");
+        return std::borrow::Cow::Owned(Vec::new());
+    };
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let directories = value
+        .split(separator)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    match normalized_basedirs(directories) {
+        Ok(directories) => std::borrow::Cow::Owned(directories),
+        Err(error) => {
+            warn!("Invalid request basedirs; path normalization disabled: {error}");
+            std::borrow::Cow::Owned(Vec::new())
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub cache: Option<CacheType>,
@@ -1375,40 +1440,7 @@ impl Config {
             file_basedirs
         };
 
-        // Validate that all basedirs are absolute paths
-        // basedirs_raw is Vec<PathBuf>
-        let mut basedirs = Vec::with_capacity(basedirs_raw.len());
-        for d in basedirs_raw {
-            let p = Utf8TypedPathBuf::from(d);
-            if !p.is_absolute() {
-                bail!("Basedir path must be absolute: {:?}", p);
-            }
-            // Normalize basedir:
-            // remove double separators, cur_dirs, parent_dirs, trailing slashes
-            let p_norm = p.normalize();
-            let mut bytes = p_norm.to_string().into_bytes();
-
-            // Always add a trailing `/` to basedirs to ensure we only match complete path
-            // components
-            bytes.push(b'/');
-
-            // normalize windows paths: use slashes and lowercase
-            let normalized = {
-                #[cfg(target_os = "windows")]
-                {
-                    normalize_win_path(&bytes)
-                }
-
-                #[cfg(not(target_os = "windows"))]
-                {
-                    bytes
-                }
-            };
-            // push only if not already present
-            if !basedirs.contains(&normalized) {
-                basedirs.push(normalized);
-            }
-        }
+        let basedirs = normalized_basedirs(basedirs_raw)?;
 
         if !basedirs.is_empty() && log::log_enabled!(log::Level::Debug) {
             let basedirs_str: Vec<String> = basedirs
@@ -3447,6 +3479,55 @@ fn test_cache_type_by_name_matches_features() {
                     format!("Cache level '{level}' requires the '{name}' feature")
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compile_basedirs_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn request_roots_replace_server_roots_without_mutating_them() {
+        let configured = vec![b"/configured/".to_vec()];
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let request = |root: &Path| {
+            vec![(
+                OsString::from("SCCACHE_BASEDIRS"),
+                root.as_os_str().to_owned(),
+            )]
+        };
+        let roots_a = compile_basedirs(&configured, &request(a.path())).into_owned();
+        let roots_b = compile_basedirs(&configured, &request(b.path())).into_owned();
+        assert_ne!(roots_a, roots_b);
+        assert_eq!(compile_basedirs(&configured, &[]).as_ref(), configured);
+        assert!(
+            compile_basedirs(&configured, &[("SCCACHE_BASEDIRS".into(), "".into())]).is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_request_cannot_reuse_unrelated_server_roots() {
+        let configured = vec![b"/configured/".to_vec()];
+        assert!(
+            compile_basedirs(
+                &configured,
+                &[("SCCACHE_BASEDIRS".into(), "relative/root".into())]
+            )
+            .is_empty()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(
+                compile_basedirs(
+                    &configured,
+                    &[("SCCACHE_BASEDIRS".into(), OsString::from_vec(vec![255]))]
+                )
+                .is_empty()
+            );
         }
     }
 }

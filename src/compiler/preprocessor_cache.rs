@@ -35,18 +35,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PreprocessorCacheModeConfig,
-    util::{
-        Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, encode_path,
-        strip_basedirs,
-    },
+    util::{Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, encode_path},
 };
 
 use super::Language;
-use super::c::hash_arguments;
+use super::c::{CACHED_ENV_VARS as COMPILER_ENV_VARS, hash_arguments};
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 3;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 
@@ -59,7 +56,19 @@ pub struct PreprocessorCacheEntry {
     /// The digest of a result is computed by hashing the output of the
     /// C preprocessor. Entries correspond to the included files during the
     /// preprocessing step.
-    results: BTreeMap<String, Vec<IncludeEntry>>,
+    results: BTreeMap<String, CachedResult>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreprocessorMetadata {
+    pub dependency_file: Option<Vec<u8>>,
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+struct CachedResult {
+    includes: Vec<IncludeEntry>,
+    metadata: PreprocessorMetadata,
 }
 
 impl PreprocessorCacheEntry {
@@ -99,6 +108,21 @@ impl PreprocessorCacheEntry {
         compilation_time_start: SystemTime,
         result_key: &str,
         included_files: impl IntoIterator<Item = (String, PathBuf)>,
+    ) {
+        self.add_result_with_metadata(
+            compilation_time_start,
+            result_key,
+            included_files,
+            PreprocessorMetadata::default(),
+        );
+    }
+
+    pub(crate) fn add_result_with_metadata(
+        &mut self,
+        compilation_time_start: SystemTime,
+        result_key: &str,
+        included_files: impl IntoIterator<Item = (String, PathBuf)>,
+        metadata: PreprocessorMetadata,
     ) {
         if self.results.len() > MAX_PREPROCESSOR_CACHE_ENTRIES {
             // Normally, there shouldn't be many result entries in the
@@ -160,13 +184,13 @@ impl PreprocessorCacheEntry {
                 }
                 match self.results.entry(result_key.to_string()) {
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        self.number_of_entries -= entry.get().len();
+                        self.number_of_entries -= entry.get().includes.len();
                         self.number_of_entries += includes.len();
-                        *entry.get_mut() = includes;
+                        *entry.get_mut() = CachedResult { includes, metadata };
                     }
                     std::collections::btree_map::Entry::Vacant(vacant) => {
                         self.number_of_entries += includes.len();
-                        vacant.insert(includes);
+                        vacant.insert(CachedResult { includes, metadata });
                     }
                 }
                 debug!("Added result key {result_key} to preprocessor cache entry");
@@ -184,11 +208,18 @@ impl PreprocessorCacheEntry {
         config: PreprocessorCacheModeConfig,
         updated: &mut bool,
     ) -> Option<String> {
+        self.lookup_result(config, updated).map(|(key, _)| key)
+    }
+
+    pub(crate) fn lookup_result(
+        &mut self,
+        config: PreprocessorCacheModeConfig,
+        updated: &mut bool,
+    ) -> Option<(String, PreprocessorMetadata)> {
         // Check newest result first since it's more likely to match.
-        for (digest, includes) in self.results.iter_mut().rev() {
-            let result_matches = Self::result_matches(digest, includes, config, updated);
-            if result_matches {
-                return Some(digest.clone());
+        for (digest, result) in self.results.iter_mut().rev() {
+            if Self::result_matches(digest, &mut result.includes, config, updated) {
+                return Some((digest.clone(), result.metadata.clone()));
             }
         }
         None
@@ -368,7 +399,7 @@ pub fn preprocessor_cache_entry_hash_key(
     plusplus: bool,
     multiarch: bool,
     config: PreprocessorCacheModeConfig,
-    basedirs: &[Vec<u8>],
+    cwd: &Path,
 ) -> anyhow::Result<Option<String>> {
     // If you change any of the inputs to the hash, you should change `FORMAT_VERSION`.
     let mut m = Digest::new();
@@ -383,7 +414,10 @@ pub fn preprocessor_cache_entry_hash_key(
     if multiarch {
         m.update(b"multiarch-per-pass");
     }
-    hash_arguments(&mut m, arguments, basedirs);
+    // Manifests and depfiles contain physical paths. Only the object cache is
+    // portable; a direct hit must describe this exact build context.
+    hash_arguments(&mut m, arguments, &[]);
+    cwd.hash(&mut HashToDigest { digest: &mut m });
     for hash in extra_hashes {
         m.update(hash.as_bytes());
     }
@@ -395,7 +429,8 @@ pub fn preprocessor_cache_entry_hash_key(
     }
 
     for (var, val) in env_vars.iter() {
-        if CACHED_ENV_VARS.contains(var.as_os_str()) {
+        if CACHED_ENV_VARS.contains(var.as_os_str()) || COMPILER_ENV_VARS.contains(var.as_os_str())
+        {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(&b"="[..]);
             val.hash(&mut HashToDigest { digest: &mut m });
@@ -412,9 +447,7 @@ pub fn preprocessor_cache_entry_hash_key(
     let mut buf = vec![];
     encode_path(&mut buf, input_file)?;
 
-    // Strip basedirs from the input file path if configured
-    let buf_to_hash = strip_basedirs(&buf, basedirs);
-    m.update(&buf_to_hash);
+    m.update(&buf);
     let (digest, finder) = file_digest(input_file, None)
         .with_context(|| format!("while hashing the input file '{}'", input_file.display()))?;
     if !config.ignore_time_macros && finder.found_time() {
@@ -876,149 +909,65 @@ mod test {
     }
 
     #[test]
-    fn test_preprocessor_cache_entry_hash_key_basedirs() {
-        #[cfg(target_os = "windows")]
-        use crate::util::normalize_win_path;
-        use std::fs;
-        use tempfile::TempDir;
-
-        // Create two different base directories
-        let dir1 = TempDir::new().unwrap();
-        let dir2 = TempDir::new().unwrap();
-        let dirs = [&dir1, &dir2]
-            .iter()
-            .map(|dir| {
-                let bytes = dir.path().to_string_lossy().into_owned().into_bytes();
-                #[cfg(target_os = "windows")]
-                return normalize_win_path(&bytes);
-                #[cfg(not(target_os = "windows"))]
-                bytes
-            })
-            .collect::<Vec<_>>();
-
-        // Create identical files with the same relative path in each directory
-        let file1_path = dir1.path().join("test.c");
-        let file2_path = dir2.path().join("test.c");
-
-        let content = b"int main() { return 0; }";
-        fs::write(&file1_path, content).unwrap();
-        fs::write(&file2_path, content).unwrap();
-
-        let config = PreprocessorCacheModeConfig::activated();
-
-        // Test 1: With basedirs, hashes should be the same
-        let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            false,
-            config,
-            &dirs,
-        )
-        .unwrap()
-        .unwrap();
-
-        let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            false,
-            config,
-            &dirs,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            hash1_with_basedirs, hash2_with_basedirs,
-            "Hashes should be equal when using basedirs with identical files in different directories"
-        );
-
-        // Test 2: With basedir1 for first, and basedir2 for second, hashes should be the same
-        let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            false,
-            config,
-            &dirs[..1],
-        )
-        .unwrap()
-        .unwrap();
-
-        let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            false,
-            config,
-            &dirs[1..],
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            hash1_with_basedirs, hash2_with_basedirs,
-            "Hashes should be equal when using basedirs with identical files in different directories"
-        );
-
-        // Test 3: Without basedirs, hashes should be different
-        let hash1_no_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            false,
-            config,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-
-        let hash2_no_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            false,
-            config,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-
+    fn test_preprocessor_cache_keys_are_build_local() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let source_a = a.path().join("main.c");
+        let source_b = b.path().join("main.c");
+        std::fs::write(&source_a, "int f(void) { return 42; }").unwrap();
+        std::fs::write(&source_b, "int f(void) { return 42; }").unwrap();
+        let key = |input: &Path, cwd: &Path, args: &[&str]| {
+            let arguments = args.iter().map(OsString::from).collect::<Vec<_>>();
+            preprocessor_cache_entry_hash_key(
+                "compiler",
+                Language::C,
+                &arguments,
+                &[],
+                None,
+                &[],
+                input,
+                false,
+                false,
+                PreprocessorCacheModeConfig::activated(),
+                cwd,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(key(&source_a, a.path(), &[]), key(&source_a, a.path(), &[]));
+        assert_ne!(key(&source_a, a.path(), &[]), key(&source_b, b.path(), &[]));
+        assert_ne!(key(&source_a, a.path(), &[]), key(&source_a, b.path(), &[]));
         assert_ne!(
-            hash1_no_basedirs, hash2_no_basedirs,
-            "Hashes should be different without basedirs for files in different directories"
+            key(&source_a, a.path(), &["-I/a"]),
+            key(&source_a, a.path(), &["-I/b"])
         );
+    }
+
+    #[test]
+    fn compiler_environment_changes_cannot_use_an_old_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("main.c");
+        std::fs::write(&input, "int f(void) { return 42; }").unwrap();
+        for name in COMPILER_ENV_VARS.iter() {
+            let key = |value: &str| {
+                preprocessor_cache_entry_hash_key(
+                    "compiler",
+                    Language::C,
+                    &[],
+                    &[],
+                    None,
+                    &[(name.to_os_string(), value.into())],
+                    &input,
+                    false,
+                    false,
+                    PreprocessorCacheModeConfig::activated(),
+                    dir.path(),
+                )
+                .unwrap()
+                .unwrap()
+            };
+            assert_ne!(key("first"), key("second"), "{name:?}");
+        }
     }
 
     #[test]
@@ -1028,9 +977,6 @@ mod test {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("test.c");
         std::fs::write(&file, b"int main() { return 0; }").unwrap();
-        let basedir = dir.path().to_string_lossy().into_owned().into_bytes();
-        #[cfg(target_os = "windows")]
-        let basedir = crate::util::normalize_win_path(&basedir);
         let key = |arguments: &[&str], multiarch: bool| {
             let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
             preprocessor_cache_entry_hash_key(
@@ -1044,7 +990,7 @@ mod test {
                 false,
                 multiarch,
                 PreprocessorCacheModeConfig::activated(),
-                std::slice::from_ref(&basedir),
+                dir.path(),
             )
             .unwrap()
             .unwrap()
@@ -1203,7 +1149,13 @@ mod test {
             })
             .collect();
         entry.number_of_entries = 300;
-        entry.results.insert("result".to_owned(), includes);
+        entry.results.insert(
+            "result".to_owned(),
+            CachedResult {
+                includes,
+                metadata: PreprocessorMetadata::default(),
+            },
+        );
 
         let mut buf = vec![];
         entry.serialize_to(&mut buf).unwrap();

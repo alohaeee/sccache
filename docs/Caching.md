@@ -56,8 +56,17 @@ In "preprocessor cache mode", [explained in the local doc](Local.md), an
 extra key is computed to cache the preprocessor output itself. It is very close
 to the C/C++ compiler one, but with additional elements:
 
-* The path of the input file
-* The hash of the input file
+* The actual absolute path of the input file and its contents
+* The actual working directory
+* Dependency-generation arguments and all output paths
+
+These paths are not normalized by basedirs in the preprocessor-cache key. A hit
+may skip preprocessing only within the same compilation context. The object key
+still normalizes line-marker filenames and compiler pathname arguments, so a new
+checkout can preprocess locally and reuse an equivalent object. Ordinary string
+literals and raw strings remain significant. Binary header outputs also include
+physical input/build context in the object key, since their embedded AST paths
+cannot be relocated by normalizing a cache key.
 
 Note that some compiler options can disable preprocessor cache mode. As of this
 writing, only `-Xpreprocessor` and `-Wp,*` do.

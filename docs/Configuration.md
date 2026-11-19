@@ -20,12 +20,17 @@ server_startup_timeout_ms = 10000
 #
 # Path matching is case-insensitive on Windows and case-sensitive on other OSes.
 #
-# Applies to the preprocessed source and to the compiler arguments
-# alike, so that a flag naming the tree, such as
+# For C/C++, applies only to preprocessor line-marker filenames
+# and pathname compiler arguments; program string data is preserved.
+# A flag naming the tree, such as
 # -ffile-prefix-map=/home/user/project=., does not tie the cache
 # entry to one checkout. In an argument only the places expected to
 # spell a pathname are considered: the whole argument, the value of
 # an =-separated option, and the value glued to a short option.
+#
+# C-family requests may override these roots through their own
+# SCCACHE_BASEDIRS environment value without restarting the server.
+# Direct manifests remain checkout-local; only objects are shared.
 #
 # For Rust, also applies to the working directory, the CARGO_*
 # variables and the variables read with env!, such as OUT_DIR.
