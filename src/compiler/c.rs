@@ -29,7 +29,8 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs, strip_basedirs_from_arg,
+    has_basedir_outside_line_markers, hash_all, strip_basedirs_from_arg,
+    strip_line_marker_basedirs,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -717,6 +718,8 @@ where
                 files,
                 storage.basedirs(),
                 tree_root.as_deref(),
+                // A path such as __FILE__ ties the result to this tree.
+                has_basedir_outside_line_markers(&preprocessor_output, storage.basedirs()),
             );
 
             if let Err(e) = storage
@@ -1741,7 +1744,8 @@ impl<'a> HashKeyParams<'a> {
         }
 
         // Strip basedirs from preprocessor output if configured
-        let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
+        let preprocessor_output_to_hash =
+            strip_line_marker_basedirs(self.preprocessor_output, self.basedirs);
 
         m.update(&preprocessor_output_to_hash);
         m.finish()
@@ -1985,6 +1989,15 @@ mod test {
             b"/home/user1/project".to_vec(), // This should match (longest)
         ];
         assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
+
+        // Test 7: A basedir in a string literal, such as __FILE__, ends up in
+        // the object file and must keep the checkouts apart
+        let literal1 = b"# 1 \"/home/user1/project/src/main.c\"\nconst char* f = \"/home/user1/project/src/main.c\";";
+        let literal2 = b"# 1 \"/home/user2/project/src/main.c\"\nconst char* f = \"/home/user2/project/src/main.c\";";
+        assert_neq!(
+            hash_with_basedirs(literal1, &basedirs),
+            hash_with_basedirs(literal2, &basedirs)
+        );
     }
 
     #[cfg(target_os = "windows")]

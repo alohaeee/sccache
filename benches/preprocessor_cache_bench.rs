@@ -64,7 +64,7 @@ fn preprocessor_cache_entry() -> (tempfile::TempDir, PreprocessorCacheEntry) {
     // seconds, so let the ones just written settle like real ones.
     std::thread::sleep(Duration::from_millis(2500));
     let mut entry = PreprocessorCacheEntry::new();
-    entry.add_result(SystemTime::UNIX_EPOCH, "result", includes, &[], None);
+    entry.add_result(SystemTime::UNIX_EPOCH, "result", includes, &[], None, false);
     (dir, entry)
 }
 
