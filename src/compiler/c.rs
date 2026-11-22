@@ -679,6 +679,14 @@ where
             )
         };
 
+        // A precompiled header keeps the absolute paths of its inputs, which
+        // prefix maps do not rewrite, so it must not be shared between checkouts.
+        let basedirs = if self.parsed_args.language.is_c_like_header() {
+            &[]
+        } else {
+            storage.basedirs()
+        };
+
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
@@ -693,7 +701,7 @@ where
         .with_extra_hashes(&extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
-        .with_basedirs(storage.basedirs())
+        .with_basedirs(basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
         .with_input_file_name(hashed_input_file_name(
             self.parsed_args.language,

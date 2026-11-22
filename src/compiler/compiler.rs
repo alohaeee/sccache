@@ -2659,6 +2659,67 @@ LLVM version: 6.0",
         assert_ne!(results[0].key, results[1].key);
     }
 
+    #[test_case("foo.c", true ; "source shares")]
+    #[test_case("foo.h", false ; "precompiled header stays local")]
+    fn test_basedirs_share_sources_but_not_headers(input: &str, shared: bool) {
+        let f = TestFixture::new();
+        let clang = f.mk_bin("clang").unwrap();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let checkouts = ["checkout1", "checkout2"].map(|name| {
+            let root = f.tempdir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join(input), "whatever").unwrap();
+            root
+        });
+        let basedirs = checkouts
+            .iter()
+            .map(|root| {
+                let mut dir = root.to_string_lossy().into_owned().into_bytes();
+                dir.push(b'/');
+                dir
+            })
+            .collect::<Vec<_>>();
+        let keys = checkouts.map(|root| {
+            let creator = new_creator();
+            next_command(
+                &creator,
+                Ok(MockChild::new(
+                    exit_status(0),
+                    "compiler_id=clang\ncompiler_version=\"16.0.0\"",
+                    "",
+                )),
+            );
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+            let c = detect_compiler(creator.clone(), &clang, &root, &[], &[], pool, None)
+                .wait()
+                .unwrap()
+                .0;
+            let output = format!("# 1 \"{}\"\nint x;\n", root.join(input).display());
+            next_command(&creator, Ok(MockChild::new(exit_status(0), output, "")));
+            let arguments = ovec!["-c", input, "-o", "out.o"];
+            let mut hasher = match c.parse_arguments(&arguments, &root, &[]) {
+                CompilerArguments::Ok(h) => h,
+                o => panic!("Bad result from parse_arguments: {:?}", o),
+            };
+            hasher
+                .generate_hash_key(
+                    &creator,
+                    root.clone(),
+                    vec![],
+                    false,
+                    pool,
+                    false,
+                    Arc::new(MockStorage::new(None, false).with_basedirs(basedirs.clone())),
+                    CacheControl::Default,
+                )
+                .wait()
+                .unwrap()
+                .key
+        });
+        assert_eq!(keys[0] == keys[1], shared);
+    }
+
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     fn test_multiarch_hash_covers_every_arch(preprocessor_cache_mode: bool) {
