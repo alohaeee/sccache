@@ -29,7 +29,7 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs, strip_basedirs_from_arg,
+    hash_all, strip_basedirs_from_arg, strip_line_marker_basedirs,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -160,6 +160,9 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
+    /// The dependency file recorded with the preprocessor cache result that
+    /// skipped preprocessing, if any.
+    dependency_file: Option<Vec<u8>>,
     preprocessor_stderr: Vec<u8>,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
@@ -528,7 +531,7 @@ where
                     read_preprocessor_cache_entry(&mut seekable, preprocessor_key)
             {
                 let mut updated = false;
-                let hit = preprocessor_cache_entry.lookup_result_digest(
+                let hit = preprocessor_cache_entry.lookup_result(
                     preprocessor_cache_mode_config,
                     tree_root.as_deref(),
                     &mut updated,
@@ -550,7 +553,7 @@ where
                 }
 
                 if !update_failed {
-                    if let Some(key) = hit {
+                    if let Some((key, dependency_file)) = hit {
                         debug!("Preprocessor cache hit: {preprocessor_key}");
                         // A compiler binary may be a symlink to another and
                         // so has the same digest, but that means
@@ -567,6 +570,7 @@ where
                             compilation: Box::new(CCompilation {
                                 parsed_args: self.parsed_args.clone(),
                                 is_locally_preprocessed: false,
+                                dependency_file,
                                 preprocessor_stderr: Vec::new(),
                                 #[cfg(feature = "dist-client")]
                                 preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
@@ -679,6 +683,14 @@ where
             )
         };
 
+        // A precompiled header keeps the absolute paths of its inputs, which
+        // prefix maps do not rewrite, so it must not be shared between checkouts.
+        let basedirs = if self.parsed_args.language.is_c_like_header() {
+            &[]
+        } else {
+            storage.basedirs()
+        };
+
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
@@ -693,7 +705,7 @@ where
         .with_extra_hashes(&extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
-        .with_basedirs(storage.basedirs())
+        .with_basedirs(basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
         .with_input_file_name(hashed_input_file_name(
             self.parsed_args.language,
@@ -711,12 +723,26 @@ where
                 .map(|(path, digest)| (digest, path))
                 .collect();
             files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            // The preprocessor has just written the dependency file for this
+            // tree; one left over from an earlier compile is not recorded.
+            let dependency_file = self
+                .parsed_args
+                .outputs
+                .get("d")
+                .map(|output| cwd.join(&output.path))
+                .filter(|path| {
+                    fs::metadata(path)
+                        .and_then(|meta| meta.modified())
+                        .is_ok_and(|mtime| mtime >= start_of_compilation)
+                })
+                .and_then(|path| fs::read(path).ok());
             preprocessor_cache_entry.add_result(
                 start_of_compilation,
                 &key,
                 files,
                 storage.basedirs(),
                 tree_root.as_deref(),
+                dependency_file,
             );
 
             if let Err(e) = storage
@@ -740,6 +766,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
+                dependency_file: None,
                 preprocessor_stderr,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
@@ -1338,6 +1365,10 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self.is_locally_preprocessed
     }
 
+    fn dependency_file(&self) -> Option<&[u8]> {
+        self.dependency_file.as_deref()
+    }
+
     fn cached_stdout(&self, stdout: Vec<u8>) -> Vec<u8> {
         if !self.is_locally_preprocessed {
             return stdout;
@@ -1741,7 +1772,8 @@ impl<'a> HashKeyParams<'a> {
         }
 
         // Strip basedirs from preprocessor output if configured
-        let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
+        let preprocessor_output_to_hash =
+            strip_line_marker_basedirs(self.preprocessor_output, self.basedirs);
 
         m.update(&preprocessor_output_to_hash);
         m.finish()
@@ -1985,6 +2017,15 @@ mod test {
             b"/home/user1/project".to_vec(), // This should match (longest)
         ];
         assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
+
+        // Test 7: A basedir in a string literal, such as __FILE__, ends up in
+        // the object file and must keep the checkouts apart
+        let literal1 = b"# 1 \"/home/user1/project/src/main.c\"\nconst char* f = \"/home/user1/project/src/main.c\";";
+        let literal2 = b"# 1 \"/home/user2/project/src/main.c\"\nconst char* f = \"/home/user2/project/src/main.c\";";
+        assert_neq!(
+            hash_with_basedirs(literal1, &basedirs),
+            hash_with_basedirs(literal2, &basedirs)
+        );
     }
 
     #[cfg(target_os = "windows")]

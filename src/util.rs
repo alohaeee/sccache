@@ -1298,6 +1298,31 @@ pub fn num_cpus() -> usize {
 /// Only paths that start with one of the basedirs are modified. The paths are expected to be
 /// in the format found in preprocessor output (e.g., `# 1 "/path/to/file"`).
 pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
+    strip_basedirs_where(preprocessor_output, basedirs, |output, pos| {
+        // Check if this is a valid boundary (start, whitespace, quote, or '<')
+        pos == 0
+            || output[pos - 1].is_ascii_whitespace()
+            || output[pos - 1] == b'"'
+            || output[pos - 1] == b'<'
+    })
+}
+
+/// Like [`strip_basedirs`], but only the filename of a line marker,
+/// `# 1 "/path/to/file"` or `#line 1 "/path/to/file"`, is modified. Elsewhere a
+/// basedir is program data: `__FILE__` or any other string literal naming the
+/// tree ends up in the object file, so two checkouts must not share it.
+pub fn strip_line_marker_basedirs<'a>(
+    preprocessor_output: &'a [u8],
+    basedirs: &[Vec<u8>],
+) -> Cow<'a, [u8]> {
+    strip_basedirs_where(preprocessor_output, basedirs, is_line_marker_path)
+}
+
+fn strip_basedirs_where<'a>(
+    preprocessor_output: &'a [u8],
+    basedirs: &[Vec<u8>],
+    is_boundary: impl Fn(&[u8], usize) -> bool,
+) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || preprocessor_output.is_empty() {
         return Cow::Borrowed(preprocessor_output);
     }
@@ -1339,13 +1364,7 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
             let finder = memchr::memmem::find_iter(normalized_output, needle);
 
             for pos in finder {
-                // Check if this is a valid boundary (start, whitespace, quote, or '<')
-                let is_boundary = pos == 0
-                    || normalized_output[pos - 1].is_ascii_whitespace()
-                    || normalized_output[pos - 1] == b'"'
-                    || normalized_output[pos - 1] == b'<';
-
-                if is_boundary {
+                if is_boundary(normalized_output, pos) {
                     matches.push((pos, needle.len(), idx));
                 }
             }
@@ -1392,6 +1411,27 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
     result.extend_from_slice(&preprocessor_output[current_pos..]);
 
     Cow::Owned(result)
+}
+
+/// Whether `pos` starts the filename of a line marker: the line holding it reads
+/// `#`, an optional `line`, a line number and an opening quote right before `pos`.
+fn is_line_marker_path(output: &[u8], pos: usize) -> bool {
+    let Some(quote) = pos.checked_sub(1).filter(|&q| output[q] == b'"') else {
+        return false;
+    };
+    let start = memchr::memrchr(b'\n', &output[..quote]).map_or(0, |n| n + 1);
+    let Some(marker) = output[start..quote].strip_prefix(b"#") else {
+        return false;
+    };
+    let is_blank = |c: &u8| matches!(c, b' ' | b'\t');
+    let marker = marker.trim_ascii_start();
+    let marker = match marker.strip_prefix(b"line") {
+        Some(rest) if rest.first().is_some_and(is_blank) => rest.trim_ascii_start(),
+        Some(_) => return false,
+        None => marker,
+    };
+    let digits = marker.iter().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && digits < marker.len() && marker[digits..].iter().all(is_blank)
 }
 
 /// The length of the basedir prefix of `path`, if it lies under one.
@@ -2401,6 +2441,25 @@ mod tests {
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         // Should only replace the second occurrence (after quote)
         let expected = b"text/home/user/file.c and \"other.c\"";
+        assert_eq!(&*output, expected);
+    }
+
+    #[test]
+    fn test_strip_basedir_only_in_line_markers() {
+        let basedir = b"/home/user/".to_vec();
+        let input = b"# 1 \"/home/user/a.c\"\n#line 7 \"/home/user/b.h\"\n\
+            const char* f = \"/home/user/a.c\";\n\
+            #pragma message(\"/home/user/c\")\n\
+            # 1 \"/other/d.h\" \"/home/user/e.h\"\n\
+            #lineX 1 \"/home/user/f.h\"\n\
+            # x \"/home/user/g.h\"";
+        let output = super::strip_line_marker_basedirs(input, std::slice::from_ref(&basedir));
+        let expected = b"# 1 \"a.c\"\n#line 7 \"b.h\"\n\
+            const char* f = \"/home/user/a.c\";\n\
+            #pragma message(\"/home/user/c\")\n\
+            # 1 \"/other/d.h\" \"/home/user/e.h\"\n\
+            #lineX 1 \"/home/user/f.h\"\n\
+            # x \"/home/user/g.h\"";
         assert_eq!(&*output, expected);
     }
 

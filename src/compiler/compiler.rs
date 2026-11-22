@@ -670,29 +670,40 @@ where
                     stderr: entry.get_stderr(),
                 };
 
-                let filtered_outputs = if compilation.is_locally_preprocessed() {
-                    // In this mode, cache entries are exclusively distinguished by their preprocessed
-                    // source contents. But two files may differ in their names and / or the names of
-                    // included files while still producing the same preprocessed output, so they get the
-                    // same cache entry. That entry will have wrong (file names) dependency informaton in
-                    // the dependency file except for the compilation unit that originally produced it.
-                    // Since we did local preprocessing, that should already have produced the dependency
-                    // file - just leave that one alone and don't overwrite it from the cache.
-                    outputs
-                        .iter()
-                        .filter(|fobj_source| fobj_source.key != "d") // key "d" means dependency file
-                        .cloned()
-                        .collect()
-                } else {
-                    // In this mode, no local preprocessing was done, so the dependency file (if any)
-                    // has not been created. But in this mode, the cache key also includes a lot of
-                    // information about filenames (and less relevant here, file hashes), so it *is* safe
-                    // to restore the dependency file from the cache.
-                    outputs.clone()
-                };
+                let dependency_file = compilation.dependency_file();
+                let filtered_outputs =
+                    if compilation.is_locally_preprocessed() || dependency_file.is_some() {
+                        // In this mode, cache entries are exclusively distinguished by their preprocessed
+                        // source contents. But two files may differ in their names and / or the names of
+                        // included files while still producing the same preprocessed output, so they get the
+                        // same cache entry. That entry will have wrong (file names) dependency informaton in
+                        // the dependency file except for the compilation unit that originally produced it.
+                        // Since we did local preprocessing, that should already have produced the dependency
+                        // file - just leave that one alone and don't overwrite it from the cache.
+                        outputs
+                            .iter()
+                            .filter(|fobj_source| fobj_source.key != "d") // key "d" means dependency file
+                            .cloned()
+                            .collect()
+                    } else {
+                        // In this mode, no local preprocessing was done, so the dependency file (if any)
+                        // has not been created. But in this mode, the cache key also includes a lot of
+                        // information about filenames (and less relevant here, file hashes), so it *is* safe
+                        // to restore the dependency file from the cache.
+                        outputs.clone()
+                    };
 
                 let hit = CompileResult::CacheHit(duration);
-                match entry.extract_objects(filtered_outputs, &pool).await {
+                let dependency_path = outputs.iter().find(|output| output.key == "d");
+                match entry
+                    .extract_objects(filtered_outputs, &pool)
+                    .await
+                    .and_then(|()| {
+                        if let (Some(bytes), Some(output)) = (dependency_file, dependency_path) {
+                            fs::write(&output.path, bytes)?;
+                        }
+                        Ok(())
+                    }) {
                     Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
@@ -1164,6 +1175,12 @@ where
 
     fn is_locally_preprocessed(&self) -> bool {
         true
+    }
+
+    /// The dependency file to write on a cache hit instead of the one stored
+    /// with the object, which may come from another checkout.
+    fn dependency_file(&self) -> Option<&[u8]> {
+        None
     }
 
     /// Adjust the stdout replayed from a cache hit for this compilation.
@@ -2657,6 +2674,67 @@ LLVM version: 6.0",
             .collect();
         assert_eq!(results.len(), 2);
         assert_ne!(results[0].key, results[1].key);
+    }
+
+    #[test_case("foo.c", true ; "source shares")]
+    #[test_case("foo.h", false ; "precompiled header stays local")]
+    fn test_basedirs_share_sources_but_not_headers(input: &str, shared: bool) {
+        let f = TestFixture::new();
+        let clang = f.mk_bin("clang").unwrap();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let checkouts = ["checkout1", "checkout2"].map(|name| {
+            let root = f.tempdir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join(input), "whatever").unwrap();
+            root
+        });
+        let basedirs = checkouts
+            .iter()
+            .map(|root| {
+                let mut dir = root.to_string_lossy().into_owned().into_bytes();
+                dir.push(b'/');
+                dir
+            })
+            .collect::<Vec<_>>();
+        let keys = checkouts.map(|root| {
+            let creator = new_creator();
+            next_command(
+                &creator,
+                Ok(MockChild::new(
+                    exit_status(0),
+                    "compiler_id=clang\ncompiler_version=\"16.0.0\"",
+                    "",
+                )),
+            );
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+            let c = detect_compiler(creator.clone(), &clang, &root, &[], &[], pool, None)
+                .wait()
+                .unwrap()
+                .0;
+            let output = format!("# 1 \"{}\"\nint x;\n", root.join(input).display());
+            next_command(&creator, Ok(MockChild::new(exit_status(0), output, "")));
+            let arguments = ovec!["-c", input, "-o", "out.o"];
+            let mut hasher = match c.parse_arguments(&arguments, &root, &[]) {
+                CompilerArguments::Ok(h) => h,
+                o => panic!("Bad result from parse_arguments: {:?}", o),
+            };
+            hasher
+                .generate_hash_key(
+                    &creator,
+                    root.clone(),
+                    vec![],
+                    false,
+                    pool,
+                    false,
+                    Arc::new(MockStorage::new(None, false).with_basedirs(basedirs.clone())),
+                    CacheControl::Default,
+                )
+                .wait()
+                .unwrap()
+                .key
+        });
+        assert_eq!(keys[0] == keys[1], shared);
     }
 
     #[test_case(true ; "with preprocessor cache")]
