@@ -142,6 +142,7 @@ impl PreprocessorCacheEntry {
         included_files: impl IntoIterator<Item = (String, PathBuf)>,
         basedirs: &[Vec<u8>],
         tree_root: Option<&Path>,
+        tree_specific: bool,
     ) {
         if self.results.len() > MAX_PREPROCESSOR_CACHE_ENTRIES {
             // Normally, there shouldn't be many result entries in the
@@ -173,7 +174,7 @@ impl PreprocessorCacheEntry {
             }
         };
         let tree_root = tree_root.as_deref();
-        let mut pinned = false;
+        let mut pinned = tree_specific;
         let includes: Result<Vec<_>, std::io::Error> = included_files
             .into_iter()
             .map(|(digest, path)| {
@@ -1016,6 +1017,15 @@ mod test {
         basedirs: &[Vec<u8>],
         tree_root: Option<&Path>,
     ) -> PreprocessorCacheEntry {
+        tree_specific_entry(header, basedirs, tree_root, false)
+    }
+
+    fn tree_specific_entry(
+        header: &Path,
+        basedirs: &[Vec<u8>],
+        tree_root: Option<&Path>,
+        tree_specific: bool,
+    ) -> PreprocessorCacheEntry {
         let mut entry = PreprocessorCacheEntry::new();
         entry.add_result(
             SystemTime::now(),
@@ -1023,6 +1033,7 @@ mod test {
             [(contents_digest(header), header.to_path_buf())],
             basedirs,
             tree_root,
+            tree_specific,
         );
         entry
     }
@@ -1035,6 +1046,38 @@ mod test {
             &mut updated,
         );
         digest.as_deref() == Some("object_key")
+    }
+
+    /// Output that names its tree outside line markers, as `__FILE__` does,
+    /// gives each checkout its own object, so only that tree may skip
+    /// preprocessing and reuse the result.
+    #[test]
+    fn test_tree_specific_result_is_pinned_to_its_tree() {
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let trees = ["a", "b"].map(|name| root.path().join(name));
+        for tree in &trees {
+            std::fs::create_dir_all(tree).unwrap();
+            std::fs::write(tree.join("config.h"), "#define CONFIG_VALUE 1").unwrap();
+        }
+        let basedirs = trees
+            .iter()
+            .map(|tree| basedir_bytes(tree))
+            .collect::<Vec<_>>();
+        let [a, b] = trees.map(|tree| {
+            compilation_tree_root(&tree.join("main.c"), &tree, &basedirs)
+                .unwrap()
+                .unwrap()
+        });
+        let header = a.join("config.h");
+
+        let shared = tree_specific_entry(&header, &basedirs, Some(&a), false);
+        assert!(hits(&shared, Some(&b)));
+
+        let pinned = tree_specific_entry(&header, &basedirs, Some(&a), true);
+        assert!(hits(&pinned, Some(&a)));
+        assert!(!hits(&pinned, Some(&b)));
     }
 
     /// Two checkouts listed as basedirs share a preprocessor cache entry, so an
