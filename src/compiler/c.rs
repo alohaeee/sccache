@@ -160,6 +160,7 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
+    dependency_file: Option<Vec<u8>>,
     preprocessor_stderr: Vec<u8>,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
@@ -528,7 +529,7 @@ where
                     read_preprocessor_cache_entry(&mut seekable, preprocessor_key)
             {
                 let mut updated = false;
-                let hit = preprocessor_cache_entry.lookup_result_digest(
+                let hit = preprocessor_cache_entry.lookup_result(
                     preprocessor_cache_mode_config,
                     tree_root.as_deref(),
                     &mut updated,
@@ -550,7 +551,7 @@ where
                 }
 
                 if !update_failed {
-                    if let Some(key) = hit {
+                    if let Some((key, dependency_file)) = hit {
                         debug!("Preprocessor cache hit: {preprocessor_key}");
                         // A compiler binary may be a symlink to another and
                         // so has the same digest, but that means
@@ -567,6 +568,7 @@ where
                             compilation: Box::new(CCompilation {
                                 parsed_args: self.parsed_args.clone(),
                                 is_locally_preprocessed: false,
+                                dependency_file,
                                 preprocessor_stderr: Vec::new(),
                                 #[cfg(feature = "dist-client")]
                                 preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
@@ -711,12 +713,26 @@ where
                 .map(|(path, digest)| (digest, path))
                 .collect();
             files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            // The preprocessor has just written the dependency file for this
+            // tree; one left over from an earlier compile is not recorded.
+            let dependency_file = self
+                .parsed_args
+                .outputs
+                .get("d")
+                .map(|output| cwd.join(&output.path))
+                .filter(|path| {
+                    fs::metadata(path)
+                        .and_then(|meta| meta.modified())
+                        .is_ok_and(|mtime| mtime >= start_of_compilation)
+                })
+                .and_then(|path| fs::read(path).ok());
             preprocessor_cache_entry.add_result(
                 start_of_compilation,
                 &key,
                 files,
                 storage.basedirs(),
                 tree_root.as_deref(),
+                dependency_file,
             );
 
             if let Err(e) = storage
@@ -740,6 +756,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
+                dependency_file: None,
                 preprocessor_stderr,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
@@ -1336,6 +1353,10 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
 
     fn is_locally_preprocessed(&self) -> bool {
         self.is_locally_preprocessed
+    }
+
+    fn dependency_file(&self) -> Option<&[u8]> {
+        self.dependency_file.as_deref()
     }
 
     fn cached_stdout(&self, stdout: Vec<u8>) -> Vec<u8> {
