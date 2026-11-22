@@ -47,7 +47,7 @@ use super::c::hash_arguments;
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 
@@ -68,6 +68,9 @@ pub struct PreprocessorCacheEntry {
 struct ResultEntry {
     valid_for: ValidFor,
     includes: Vec<IncludeEntry>,
+    /// The dependency file the recording compilation wrote. The object entry
+    /// carries the one of whichever checkout produced the object first.
+    dependency_file: Option<Vec<u8>>,
 }
 
 /// Which compilations a result may be used for.
@@ -142,6 +145,7 @@ impl PreprocessorCacheEntry {
         included_files: impl IntoIterator<Item = (String, PathBuf)>,
         basedirs: &[Vec<u8>],
         tree_root: Option<&Path>,
+        dependency_file: Option<Vec<u8>>,
     ) {
         if self.results.len() > MAX_PREPROCESSOR_CACHE_ENTRIES {
             // Normally, there shouldn't be many result entries in the
@@ -173,7 +177,8 @@ impl PreprocessorCacheEntry {
             }
         };
         let tree_root = tree_root.as_deref();
-        let mut pinned = false;
+        // A dependency file names the files of the tree that wrote it.
+        let mut pinned = dependency_file.is_some();
         let includes: Result<Vec<_>, std::io::Error> = included_files
             .into_iter()
             .map(|(digest, path)| {
@@ -207,6 +212,7 @@ impl PreprocessorCacheEntry {
                         ValidFor::AnyTree
                     },
                     includes,
+                    dependency_file,
                 };
                 let new_number_of_entries = includes.includes.len() + self.number_of_entries;
                 if new_number_of_entries > MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES {
@@ -247,6 +253,18 @@ impl PreprocessorCacheEntry {
         tree_root: Option<&Path>,
         updated: &mut bool,
     ) -> Option<String> {
+        self.lookup_result(config, tree_root, updated)
+            .map(|(digest, _)| digest)
+    }
+
+    /// Returns the digest and the dependency file of the first result whose
+    /// expected included files are already on disk and have not changed.
+    pub fn lookup_result(
+        &mut self,
+        config: PreprocessorCacheModeConfig,
+        tree_root: Option<&Path>,
+        updated: &mut bool,
+    ) -> Option<(String, Option<Vec<u8>>)> {
         let comparable_root = match tree_root.map(comparable_dir).transpose() {
             Ok(root) => root,
             Err(e) => {
@@ -263,7 +281,7 @@ impl PreprocessorCacheEntry {
             let result_matches =
                 Self::result_matches(digest, &mut result.includes, config, tree_root, updated);
             if result_matches {
-                return Some(digest.clone());
+                return Some((digest.clone(), result.dependency_file.clone()));
             }
         }
         None
@@ -1016,6 +1034,15 @@ mod test {
         basedirs: &[Vec<u8>],
         tree_root: Option<&Path>,
     ) -> PreprocessorCacheEntry {
+        entry_with_dependency_file(header, basedirs, tree_root, None)
+    }
+
+    fn entry_with_dependency_file(
+        header: &Path,
+        basedirs: &[Vec<u8>],
+        tree_root: Option<&Path>,
+        dependency_file: Option<&[u8]>,
+    ) -> PreprocessorCacheEntry {
         let mut entry = PreprocessorCacheEntry::new();
         entry.add_result(
             SystemTime::now(),
@@ -1023,18 +1050,25 @@ mod test {
             [(contents_digest(header), header.to_path_buf())],
             basedirs,
             tree_root,
+            dependency_file.map(<[u8]>::to_vec),
         );
         entry
     }
 
-    fn hits(entry: &PreprocessorCacheEntry, tree_root: Option<&Path>) -> bool {
+    fn lookup(
+        entry: &PreprocessorCacheEntry,
+        tree_root: Option<&Path>,
+    ) -> Option<(String, Option<Vec<u8>>)> {
         let mut updated = false;
-        let digest = entry.clone().lookup_result_digest(
+        entry.clone().lookup_result(
             PreprocessorCacheModeConfig::activated(),
             tree_root,
             &mut updated,
-        );
-        digest.as_deref() == Some("object_key")
+        )
+    }
+
+    fn hits(entry: &PreprocessorCacheEntry, tree_root: Option<&Path>) -> bool {
+        lookup(entry, tree_root).is_some_and(|(digest, _)| digest == "object_key")
     }
 
     /// Two checkouts listed as basedirs share a preprocessor cache entry, so an
@@ -1099,6 +1133,40 @@ mod test {
         let entry = entry_with_header(&outside, &basedirs, Some(&tree));
 
         assert!(hits(&entry, Some(&tree)));
+    }
+
+    /// A dependency file names the headers of the checkout that wrote it, so a
+    /// result that carries one is only used, and its file restored, there.
+    #[test]
+    fn test_dependency_file_is_pinned_to_its_tree() {
+        use tempfile::TempDir;
+
+        let root = TempDir::new().unwrap();
+        let trees = ["a", "b"].map(|name| root.path().join(name));
+        for tree in &trees {
+            std::fs::create_dir_all(tree).unwrap();
+            std::fs::write(tree.join("config.h"), "#define CONFIG_VALUE 1").unwrap();
+        }
+        let basedirs = trees
+            .iter()
+            .map(|tree| basedir_bytes(tree))
+            .collect::<Vec<_>>();
+        let [a, b] = trees.map(|tree| {
+            compilation_tree_root(&tree.join("main.c"), &tree, &basedirs)
+                .unwrap()
+                .unwrap()
+        });
+        let header = a.join("config.h");
+
+        let shared = entry_with_header(&header, &basedirs, Some(&a));
+        assert_eq!(lookup(&shared, Some(&b)), Some(("object_key".into(), None)));
+
+        let entry = entry_with_dependency_file(&header, &basedirs, Some(&a), Some(b"a.o: a.h"));
+        assert_eq!(
+            lookup(&entry, Some(&a)),
+            Some(("object_key".into(), Some(b"a.o: a.h".to_vec())))
+        );
+        assert_eq!(lookup(&entry, Some(&b)), None);
     }
 
     /// A header found in a basedir other than the one holding the source, a
@@ -1580,6 +1648,7 @@ mod test {
             ResultEntry {
                 valid_for: ValidFor::AnyTree,
                 includes,
+                dependency_file: None,
             },
         );
 

@@ -670,7 +670,10 @@ where
                     stderr: entry.get_stderr(),
                 };
 
-                let filtered_outputs = if compilation.is_locally_preprocessed() {
+                let dependency_file = compilation.dependency_file();
+                let keep_local_dependency_file =
+                    compilation.is_locally_preprocessed() || dependency_file.is_some();
+                let filtered_outputs = if keep_local_dependency_file {
                     // In this mode, cache entries are exclusively distinguished by their preprocessed
                     // source contents. But two files may differ in their names and / or the names of
                     // included files while still producing the same preprocessed output, so they get the
@@ -678,6 +681,7 @@ where
                     // the dependency file except for the compilation unit that originally produced it.
                     // Since we did local preprocessing, that should already have produced the dependency
                     // file - just leave that one alone and don't overwrite it from the cache.
+                    // A preprocessor cache hit brings the one its own compilation wrote.
                     outputs
                         .iter()
                         .filter(|fobj_source| fobj_source.key != "d") // key "d" means dependency file
@@ -692,7 +696,16 @@ where
                 };
 
                 let hit = CompileResult::CacheHit(duration);
-                match entry.extract_objects(filtered_outputs, &pool).await {
+                let dependency_path = outputs.iter().find(|output| output.key == "d");
+                match entry
+                    .extract_objects(filtered_outputs, &pool)
+                    .await
+                    .and_then(|()| {
+                        if let (Some(bytes), Some(output)) = (dependency_file, dependency_path) {
+                            fs::write(&output.path, bytes)?;
+                        }
+                        Ok(())
+                    }) {
                     Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
@@ -1164,6 +1177,12 @@ where
 
     fn is_locally_preprocessed(&self) -> bool {
         true
+    }
+
+    /// The dependency file to write on a cache hit instead of the one stored
+    /// with the object, which may come from another checkout.
+    fn dependency_file(&self) -> Option<&[u8]> {
+        None
     }
 
     /// Adjust the stdout replayed from a cache hit for this compilation.
